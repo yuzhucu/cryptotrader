@@ -725,6 +725,82 @@ class ReversedMomentumTrader(APrioriAgent):
         self.std_span = int(kwargs['std_span'])
 
 
+class ONSTrader(APrioriAgent):
+    """
+    Online Newton Step algorithm.
+
+    Reference:
+        A.Agarwal, E.Hazan, S.Kale, R.E.Schapire.
+        Algorithms for Portfolio Management based on the Newton Method, 2006.
+        http://machinelearning.wustl.edu/mlpapers/paper_files/icml2006_AgarwalHKS06.pdf
+    """
+
+    def __repr__(self):
+        return "ONSTrader"
+
+    def __init__(self, delta=0.1, beta=2., eta=0., fiat="USDT", name=""):
+        """
+        :param delta, beta, eta: Model parameters. See paper.
+        """
+        super().__init__(fiat=fiat, name=name)
+        self.delta = delta
+        self.beta = beta
+        self.eta = eta
+
+    def predict(self, obs):
+        price_relative = np.empty(obs.columns.levels[0].shape[0] - 1, dtype=np.float64)
+        for key, symbol in enumerate([s for s in obs.columns.levels[0] if s is not self.fiat]):
+            price_relative[key] = np.float64(
+                obs.get_value(obs.index[-1], (symbol, 'open')) / obs.get_value(obs.index[-2], (symbol, 'open')))
+        return np.append(price_relative, [1.])
+
+    def rebalance(self, obs):
+        if self.step == 0:
+            n_pairs = obs.columns.levels[0].shape[0]
+            action = np.ones(n_pairs)
+            action[-1] = 0
+            self.A = np.mat(np.eye(n_pairs))
+            self.b = np.mat(np.zeros(n_pairs)).T
+            return array_normalize(action)
+        else:
+            prev_posit = self.get_portfolio_vector(obs, index=-1)
+            price_relative = self.predict(obs)
+            return self.update(prev_posit, price_relative)
+
+    def update(self, b, x):
+        # calculate gradient
+        grad = np.mat(x / np.dot(b, x)).T
+        # update A
+        self.A += grad * grad.T
+        # update b
+        self.b += (1 + 1. / self.beta) * grad
+
+        # projection of p induced by norm A
+        pp = self.projection_in_norm(self.delta * self.A.I * self.b, self.A)
+
+        return pp * (1 - self.eta) + np.ones(len(x)) / float(len(x)) * self.eta
+
+    def projection_in_norm(self, x, M):
+        """ Projection of x to simplex indiced by matrix M. Uses quadratic programming.
+        """
+        m = M.shape[0]
+
+        P = matrix(2 * M)
+        q = matrix(-2 * M * x)
+        G = matrix(-np.eye(m))
+        h = matrix(np.zeros((m, 1)))
+        A = matrix(np.ones((1, m)))
+        b = matrix(1.)
+
+        sol = solvers.qp(P, q, G, h, A, b)
+        return np.squeeze(sol['x'])
+
+    def set_params(self, **kwargs):
+        self.delta = kwargs['delta']
+        self.beta = kwargs['beta']
+        self.eta = kwargs['eta']
+
+
 # Pattern trading
 class HarmonicTrader(APrioriAgent):
     """
@@ -883,7 +959,7 @@ class PAMRTrader(APrioriAgent):
             # Log values
             self.log['price_change'].update(**{symbol.split('_')[1]: "%.04f" % (1 / price_relative[key])})
 
-        return price_relative
+        return np.append(price_relative,[1.])
 
     def rebalance(self, obs):
         """
@@ -899,7 +975,7 @@ class PAMRTrader(APrioriAgent):
         else:
             prev_posit = self.get_portfolio_vector(obs, index=-1)
             price_relative = self.predict(obs)
-            return self.update(prev_posit[:-1], price_relative)
+            return self.update(prev_posit, price_relative)
 
     def update(self, b, x):
         """
@@ -946,7 +1022,7 @@ class PAMRTrader(APrioriAgent):
         self.log['total_portfolio_change'] = 1 / portvar
 
         # project it onto simplex
-        return np.append(simplex_proj(b), [0])
+        return simplex_proj(b)
 
     def set_params(self, **kwargs):
         self.sensitivity = kwargs['sensitivity']
